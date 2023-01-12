@@ -3,10 +3,11 @@
 use anyhow::anyhow;
 use cid::Cid;
 use fil_actors_runtime::runtime::Runtime;
-use fil_actors_runtime::{ActorDowncast, Map};
+use fil_actors_runtime::{actor_error, ActorDowncast, ActorError, Map};
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::Cbor;
 use fvm_ipld_hamt::BytesKey;
+use fvm_shared::address::Address;
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
@@ -24,6 +25,11 @@ use super::cross::*;
 use super::subnet::*;
 use super::types::*;
 
+/// We are using a HAMT to track the cid of `PostboxItem`, the hamt
+/// is really a indicator of whether is cid is already processed.
+/// TODO: maybe cid is not the best way to be used as the key.
+type PostBox = TCid<THamt<Cid, Vec<u8>>>;
+
 /// Storage power actor state
 #[derive(Serialize, Deserialize)]
 pub struct State {
@@ -34,6 +40,9 @@ pub struct State {
     pub check_period: ChainEpoch,
     pub checkpoints: TCid<THamt<ChainEpoch, Checkpoint>>,
     pub check_msg_registry: TCid<THamt<TCid<TLink<CrossMsgs>>, CrossMsgs>>,
+    /// `postbox` keeps track for an EOA of all the cross-net messages triggered by
+    /// an actor that need to be propagated further through the hierarchy.
+    pub postbox: PostBox,
     pub nonce: u64,
     pub bottomup_nonce: u64,
     pub bottomup_msg_meta: TCid<TAmt<CrossMsgMeta, CROSSMSG_AMT_BITWIDTH>>,
@@ -60,6 +69,7 @@ impl State {
             },
             checkpoints: TCid::new_hamt(store)?,
             check_msg_registry: TCid::new_hamt(store)?,
+            postbox: TCid::new_hamt(store)?,
             nonce: Default::default(),
             bottomup_nonce: Default::default(),
             bottomup_msg_meta: TCid::new_amt(store)?,
@@ -450,7 +460,6 @@ impl State {
         match tp {
             IPCMsgType::TopDown => self.commit_topdown_msg(store, cross_msg)?,
             IPCMsgType::BottomUp => self.commit_bottomup_msg(store, cross_msg, curr_epoch)?,
-            _ => return Err(anyhow!("cross-msg is not of the right type")),
         };
         Ok(tp)
     }
@@ -480,6 +489,92 @@ impl State {
     /// noop is triggered to notify when a crossMsg fails to be applied successfully.
     pub fn noop_msg(&self) {
         panic!("error committing cross-msg. noop should be returned but not implemented yet");
+    }
+
+    /// Insert a cross message to the `postbox` before propagate can be called for the
+    /// message to be propagated upwards or downwards.
+    ///
+    /// # Arguments
+    /// * `st` - The blockstore
+    /// * `owners` - The owners of the message that started the cross message. If None means
+    ///              anyone can propagate this message. Allows multiple owners.
+    /// * `gas` - The gas needed to propagate this message
+    /// * `msg` - The actual cross msg to store in `postbox`
+    pub(crate) fn insert_postbox<BS: Blockstore>(
+        &mut self,
+        st: &BS,
+        owners: Option<Vec<Address>>,
+        msg: CrossMsg,
+    ) -> anyhow::Result<()> {
+        let item = PostBoxItem::new(msg, owners);
+        let (cid, bytes) = item
+            .serialize_with_cid()
+            .map_err(|_| anyhow!("cannot serialize postbox item"))?;
+        self.postbox.update(st, |postbox| {
+            let key = BytesKey::from(cid.to_bytes());
+            postbox.set(key, bytes)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn load_from_postbox<BS: Blockstore>(
+        &mut self,
+        st: &BS,
+        cid: Cid,
+    ) -> anyhow::Result<PostBoxItem> {
+        let postbox = self.postbox.load(st)?;
+        let optional = postbox.get(&BytesKey::from(cid.to_bytes()))?;
+        if optional.is_none() {
+            return Err(anyhow!("cid not found in postbox"));
+        }
+
+        let raw_bytes = optional.unwrap();
+        PostBoxItem::deserialize(raw_bytes.to_vec())
+            .map_err(|_| anyhow!("cannot parse postbox item"))
+    }
+
+    pub(crate) fn swap_postbox_item<BS: Blockstore>(
+        &mut self,
+        st: &BS,
+        cid: Cid,
+        item: PostBoxItem,
+    ) -> anyhow::Result<()> {
+        self.postbox.modify(st, |postbox| {
+            let previous = postbox.delete(&BytesKey::from(cid.to_bytes()))?;
+            if previous.is_none() {
+                return Err(anyhow!("cid not found in postbox"));
+            }
+            let (cid, bytes) = item
+                .serialize_with_cid()
+                .map_err(|_| anyhow!("cannot serialize postbox item"))?;
+            let key = BytesKey::from(cid.to_bytes());
+            postbox.set(key, bytes)?;
+
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    /// Removes the cid for postbox.
+    ///
+    /// Note that caller should have checked the msg caller has the permissions to perform the
+    /// deletion, this method does not check.
+    pub(crate) fn remove_from_postbox<BS: Blockstore>(
+        &mut self,
+        st: &BS,
+        cid: Cid,
+    ) -> Result<(), ActorError> {
+        self.postbox
+            .modify(st, |postbox| {
+                postbox.delete(&BytesKey::from(cid.to_bytes()))?;
+                Ok(())
+            })
+            .map_err(|e| {
+                log::error!("encountered error deleting from postbox: {:?}", e);
+                actor_error!(unhandled_message, "cannot delete from postbox")
+            })?;
+        Ok(())
     }
 }
 
